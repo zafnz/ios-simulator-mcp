@@ -76,6 +76,15 @@ async function idb(...args: string[]) {
 }
 
 // Read filtered tools from environment variable
+// When IDB_UDID is set, lock this server instance to a single simulator.
+// All tools will target only this simulator, ignoring any udid parameter.
+const LOCKED_UDID = process.env.IDB_UDID;
+if (LOCKED_UDID && !UDID_REGEX.test(LOCKED_UDID)) {
+  throw new Error(
+    `Invalid IDB_UDID environment variable: "${LOCKED_UDID}" does not match expected UDID format`
+  );
+}
+
 const FILTERED_TOOLS =
   process.env.IOS_SIMULATOR_MCP_FILTERED_TOOLS?.split(",").map((tool) =>
     tool.trim()
@@ -127,6 +136,12 @@ async function getBootedDevice() {
       if (match) {
         const deviceId = match[1];
         const deviceName = line.split("(")[0].trim();
+
+        // When locked to a specific UDID, skip other simulators
+        if (LOCKED_UDID && deviceId !== LOCKED_UDID) {
+          continue;
+        }
+
         return {
           name: deviceName,
           id: deviceId,
@@ -135,12 +150,21 @@ async function getBootedDevice() {
     }
   }
 
+  if (LOCKED_UDID) {
+    throw Error(`Locked simulator ${LOCKED_UDID} is not booted`);
+  }
+
   throw Error("No booted simulator found");
 }
 
 async function getBootedDeviceId(
   deviceId: string | undefined
 ): Promise<string> {
+  // When locked to a specific UDID, always use it
+  if (LOCKED_UDID) {
+    return LOCKED_UDID;
+  }
+
   // If deviceId not provided, get the currently booted simulator
   let actualDeviceId = deviceId;
   if (!actualDeviceId) {
@@ -782,7 +806,7 @@ if (!isToolFiltered("record_video")) {
         const recordingProcess = spawn("xcrun", [
           "simctl",
           "io",
-          "booted",
+          LOCKED_UDID ?? "booted",
           "recordVideo",
           ...(codec ? [`--codec=${codec}`] : []),
           ...(display ? [`--display=${display}`] : []),
