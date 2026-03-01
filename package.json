@@ -1,13 +1,13 @@
 {
-  "name": "ios-simulator-mcp",
+  "name": "ios-multi-simulator-mcp",
   "version": "1.5.2",
-  "description": "MCP server for interacting with the iOS simulator",
+  "description": "MCP server for session-based iOS simulator lifecycle management, enabling multi-agent parallel control",
   "bin": {
-    "ios-simulator-mcp": "build/index.js"
+    "ios-multi-simulator-mcp": "build/index.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/joshuayoes/ios-simulator-mcp.git"
+    "url": "git+https://github.com/zafnz/ios-simulator-mcp.git"
   },
   "files": [
     "build",
@@ -31,6 +31,12 @@
     "name": "Joshua Yoes",
     "url": "https://joshuayoes.com"
   },
+  "contributors": [
+    {
+      "name": "zafnz",
+      "url": "https://github.com/zafnz"
+    }
+  ],
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.18.2",

@@ -8,8 +8,8 @@ You can run a test case copy and pasting the test case into a chat in an MCP cli
 
 **Note:** This test case was written using iOS 17.2 and the native Photos app. It may need to be adjusted for other iOS versions or Photos app changes.
 
-1. Have the user open the native Photo app in the iOS simulator.
-2. Call `get_booted_sim_id` to get the UDID of the booted simulator.
+1. Call `open_simulator` to open a new simulator, with an appropriate `id`.
+2. Wait 30 seconds for boot, then use `ui_view` and `ui_tap` to open the Photos app.
 3. Call `record_video` to start recording a screen recording of the test.
 4. Call `ui_describe_all` to make sure we are on the All Photos tab.
 5. Call `ui_describe_point` to find the x and y coordinates for tapping the Search tab button.

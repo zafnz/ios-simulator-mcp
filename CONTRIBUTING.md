@@ -1,6 +1,7 @@
-# Contributing to iOS Simulator MCP
+# Contributing to iOS Multi Simulator MCP
 
-Thank you for your interest in contributing to the iOS Simulator MCP server! This guide outlines our contribution process and project philosophy.
+**Important Note**:
+This is a fork of the original joshuayoes/ios-simulator-mcp](https://github.com/joshuayoes/ios-simulator-mcp) MCP. The changes this fork makes are fundamentally different to Joshua's intent, so I chose to fork as Open Source ecology intended. If you wish to contribute to this project that is wonderful, but I highly encourage you to see if your contributions can also benefit the original project too. 
 
 ## Project Philosophy
 
@@ -21,9 +22,7 @@ This project is **intentionally simple** and follows these core principles:
 
 ### Architectural Stability
 
-- **No significant architecture changes** without prior discussion
-- Major changes must be discussed with the author beforehand via GitHub issues or DMs
-- Changes should address real pain points that cannot be solved by existing implementation or configuration
+If you want to make significant changes to this fork then I'd suggest talking to the author first, however you could equally just fork your own too ;).
 
 ## Prerequisites
 
