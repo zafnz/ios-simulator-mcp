@@ -191,7 +191,7 @@ const server = new McpServer(
   },
   {
     instructions:
-      "iOS Simulator MCP server. Screenshots (ui_view, screenshot) are always captured in the physical portrait pixel orientation, regardless of how the device is rotated. If the simulator is in landscape, the screenshot content will appear sideways. Coordinate-based tools (ui_tap, ui_swipe, ui_describe_point) use the logical coordinate system, which changes with rotation. When the device is rotated, you will need to transform between portrait pixel positions and logical coordinates to tap accurately.",
+      "iOS Simulator MCP server. Use ui_describe_all to find tap coordinates — its frame values map directly to ui_tap coordinates in all orientations. Do not derive tap coordinates from ui_view screenshots, as they may not match the logical coordinate system (especially when the device is rotated). ui_view is useful for visual verification but ui_describe_all is the reliable way to navigate.",
   }
 );
 
