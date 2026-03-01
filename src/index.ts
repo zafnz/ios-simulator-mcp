@@ -11,12 +11,6 @@ import fs from "fs";
 
 const execFileAsync = promisify(execFile);
 
-/**
- * Strict UDID/UUID pattern: 8-4-4-4-12 hexadecimal characters (e.g. 37A360EC-75F9-4AEC-8EFA-10F4A58D8CCA)
- */
-const UDID_REGEX =
-  /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
-
 const TMP_ROOT_DIR = fs.mkdtempSync(
   path.join(os.tmpdir(), "ios-simulator-mcp-")
 );
@@ -86,10 +80,120 @@ function isToolFiltered(toolName: string): boolean {
   return FILTERED_TOOLS.includes(toolName);
 }
 
-const server = new McpServer({
-  name: "ios-simulator",
-  version: require("../package.json").version,
-});
+// --- Simulator lifecycle management ---
+
+/** Tracks managed simulators by session id */
+const managedSimulators = new Map<
+  string,
+  { udid: string; name: string; owned: boolean }
+>();
+
+/** Zod schema for the session id parameter, reused across all tools */
+const sessionIdSchema = z
+  .string()
+  .max(128)
+  .describe("Unique identifier for your session");
+
+/**
+ * Returns the UDID of the managed simulator for the given session id.
+ * Throws if no simulator exists for that session.
+ */
+function getManagedSimulatorId(id: string): string {
+  const sim = managedSimulators.get(id);
+  if (!sim) {
+    throw new Error(
+      `No simulator is running for session "${id}". Call start_simulator first.`
+    );
+  }
+  return sim.udid;
+}
+
+/**
+ * Finds a device type identifier matching the given keyword.
+ * Returns the first (newest) match since simctl lists newest devices first.
+ */
+async function findDeviceType(
+  keyword: string
+): Promise<{ identifier: string; name: string }> {
+  const { stdout } = await run("xcrun", [
+    "simctl",
+    "list",
+    "devicetypes",
+    "-j",
+  ]);
+  const data = JSON.parse(stdout);
+  const deviceTypes: { name: string; identifier: string }[] = data.devicetypes;
+  const lowerKeyword = keyword.toLowerCase();
+  const matches = deviceTypes.filter((dt) =>
+    dt.name.toLowerCase().includes(lowerKeyword)
+  );
+
+  if (matches.length === 0) {
+    throw new Error(
+      `No device type found matching "${keyword}". Available types: ${deviceTypes.map((dt) => dt.name).join(", ")}`
+    );
+  }
+
+  // Return the first match (newest model, since simctl lists newest first)
+  return matches[0];
+}
+
+/**
+ * Finds the latest available iOS runtime.
+ */
+async function findLatestRuntime(): Promise<string> {
+  const { stdout } = await run("xcrun", [
+    "simctl",
+    "list",
+    "runtimes",
+    "-j",
+  ]);
+  const data = JSON.parse(stdout);
+  const runtimes: { name: string; identifier: string; isAvailable: boolean }[] =
+    data.runtimes;
+  const iosRuntimes = runtimes.filter(
+    (r) => r.isAvailable && r.name.startsWith("iOS")
+  );
+
+  if (iosRuntimes.length === 0) {
+    throw new Error("No available iOS runtimes found. Install one via Xcode.");
+  }
+
+  return iosRuntimes[iosRuntimes.length - 1].identifier;
+}
+
+/**
+ * Cleans up all managed simulators (shutdown + delete). Ignores errors.
+ */
+async function cleanupAllSimulators(): Promise<void> {
+  for (const [id, { udid, owned }] of managedSimulators) {
+    if (!owned) continue;
+    try {
+      await run("xcrun", ["simctl", "shutdown", udid]);
+    } catch {
+      // Ignore - might already be shut down
+    }
+    try {
+      await run("xcrun", ["simctl", "delete", udid]);
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+  managedSimulators.clear();
+}
+
+// --- Server setup ---
+
+const server = new McpServer(
+  {
+    name: "ios-simulator",
+    version: require("../package.json").version,
+  },
+  {
+    instructions:
+      "iOS Simulator MCP server. Screenshots (ui_view, screenshot) are always captured in the physical portrait pixel orientation, regardless of how the device is rotated. If the simulator is in landscape, the screenshot content will appear sideways. Coordinate-based tools (ui_tap, ui_swipe, ui_describe_point) use the logical coordinate system, which changes with rotation. When the device is rotated, you will need to transform between portrait pixel positions and logical coordinates to tap accurately.",
+  }
+);
 
 function toError(input: unknown): Error {
   if (input instanceof Error) return input;
@@ -113,62 +217,61 @@ function errorWithTroubleshooting(message: string): string {
   return `${message}\n\nFor help, see the ${troubleshootingLink()}`;
 }
 
-async function getBootedDevice() {
-  const { stdout, stderr } = await run("xcrun", ["simctl", "list", "devices"]);
+// --- Tool registrations ---
 
-  if (stderr) throw new Error(stderr);
-
-  // Parse the output to find booted device
-  const lines = stdout.split("\n");
-  for (const line of lines) {
-    if (line.includes("Booted")) {
-      // Extract the UUID - it's inside parentheses
-      const match = line.match(/\(([-0-9A-F]+)\)/);
-      if (match) {
-        const deviceId = match[1];
-        const deviceName = line.split("(")[0].trim();
-        return {
-          name: deviceName,
-          id: deviceId,
-        };
-      }
-    }
-  }
-
-  throw Error("No booted simulator found");
-}
-
-async function getBootedDeviceId(
-  deviceId: string | undefined
-): Promise<string> {
-  // If deviceId not provided, get the currently booted simulator
-  let actualDeviceId = deviceId;
-  if (!actualDeviceId) {
-    const { id } = await getBootedDevice();
-    actualDeviceId = id;
-  }
-  if (!actualDeviceId) {
-    throw new Error("No booted simulator found and no deviceId provided");
-  }
-  return actualDeviceId;
-}
-
-// Register tools only if they're not filtered
-if (!isToolFiltered("get_booted_sim_id")) {
+if (!isToolFiltered("start_simulator")) {
   server.tool(
-    "get_booted_sim_id",
-    "Get the ID of the currently booted iOS simulator",
-    { title: "Get Booted Simulator ID", readOnlyHint: true, openWorldHint: true },
-    async () => {
+    "start_simulator",
+    "Creates, boots, and opens an iOS simulator for the given session. Each session can have one simulator — call destroy_simulator first to switch types.",
+    {
+      id: sessionIdSchema,
+      type: z
+        .string()
+        .optional()
+        .describe(
+          'Device type keyword (e.g. "iPhone", "iPad", "iPhone 16 Pro"). Defaults to the latest iPhone.'
+        ),
+    },
+    { title: "Start Simulator", readOnlyHint: false, openWorldHint: true },
+    async ({ id, type }) => {
       try {
-        const { id, name } = await getBootedDevice();
+        const existing = managedSimulators.get(id);
+        if (existing) {
+          throw new Error(
+            `A simulator is already running for session "${id}": "${existing.name}" (${existing.udid}). Call destroy_simulator first.`
+          );
+        }
+
+        const keyword = type || "iPhone";
+        const deviceType = await findDeviceType(keyword);
+        const runtime = await findLatestRuntime();
+
+        // Build device name: <SIM_NAME>_<id>_<type_keyword>
+        const deviceName = `${id}_${keyword.toLowerCase().replace(/\s+/g, "-")}`;
+
+        // Create the simulator
+        const { stdout: udid } = await run("xcrun", [
+          "simctl",
+          "create",
+          deviceName,
+          deviceType.identifier,
+          runtime,
+        ]);
+
+        // Boot the simulator
+        await run("xcrun", ["simctl", "boot", udid]);
+
+        // Ensure Simulator.app is open
+        await run("open", ["-a", "Simulator.app"]);
+
+        managedSimulators.set(id, { udid, name: deviceName, owned: true });
 
         return {
           isError: false,
           content: [
             {
               type: "text",
-              text: `Booted Simulator: "${name}". UUID: "${id}"`,
+              text: `Simulator started: "${deviceName}" (${deviceType.name}, ${udid})`,
             },
           ],
         };
@@ -179,7 +282,7 @@ if (!isToolFiltered("get_booted_sim_id")) {
             {
               type: "text",
               text: errorWithTroubleshooting(
-                `Error: ${toError(error).message}`
+                `Error starting simulator: ${toError(error).message}`
               ),
             },
           ],
@@ -189,21 +292,40 @@ if (!isToolFiltered("get_booted_sim_id")) {
   );
 }
 
-if (!isToolFiltered("open_simulator")) {
+if (!isToolFiltered("destroy_simulator")) {
   server.tool(
-    "open_simulator",
-    "Opens the iOS Simulator application",
-    { title: "Open Simulator", readOnlyHint: false, openWorldHint: true },
-    async () => {
+    "destroy_simulator",
+    "Shuts down and deletes the simulator for the given session. Call start_simulator afterwards to create a new one.",
+    {
+      id: sessionIdSchema,
+    },
+    { title: "Destroy Simulator", readOnlyHint: false, openWorldHint: true },
+    async ({ id }) => {
       try {
-        await run("open", ["-a", "Simulator.app"]);
+        const sim = managedSimulators.get(id);
+        if (!sim) {
+          throw new Error(
+            `No simulator is running for session "${id}".`
+          );
+        }
+
+        const { name, udid, owned } = sim;
+
+        if (owned) {
+          await run("xcrun", ["simctl", "shutdown", udid]);
+          await run("xcrun", ["simctl", "delete", udid]);
+        }
+
+        managedSimulators.delete(id);
 
         return {
           isError: false,
           content: [
             {
               type: "text",
-              text: "Simulator.app opened successfully",
+              text: owned
+                ? `Simulator destroyed: "${name}" (${udid})`
+                : `Detached from simulator: "${name}" (${udid})`,
             },
           ],
         };
@@ -214,7 +336,91 @@ if (!isToolFiltered("open_simulator")) {
             {
               type: "text",
               text: errorWithTroubleshooting(
-                `Error opening Simulator.app: ${toError(error).message}`
+                `Error destroying simulator: ${toError(error).message}`
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+if (!isToolFiltered("attach_simulator")) {
+  server.tool(
+    "attach_simulator",
+    "Attaches to an existing, already-booted iOS simulator by UDID. Use this instead of start_simulator when you want to control a simulator that was created externally.",
+    {
+      id: sessionIdSchema,
+      udid: z
+        .string()
+        .regex(
+          /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/
+        )
+        .describe("UDID of the simulator to attach to"),
+    },
+    { title: "Attach Simulator", readOnlyHint: false, openWorldHint: true },
+    async ({ id, udid }) => {
+      try {
+        const existing = managedSimulators.get(id);
+        if (existing) {
+          throw new Error(
+            `Session "${id}" is already attached to simulator "${existing.name}" (${existing.udid}). Call destroy_simulator first.`
+          );
+        }
+
+        // Verify the simulator exists and is booted
+        const { stdout } = await run("xcrun", [
+          "simctl",
+          "list",
+          "devices",
+          "-j",
+        ]);
+        const data = JSON.parse(stdout);
+        let found: { name: string; state: string } | null = null;
+        for (const runtime of Object.values(data.devices) as any[]) {
+          for (const device of runtime) {
+            if (device.udid === udid) {
+              found = device;
+              break;
+            }
+          }
+          if (found) break;
+        }
+
+        if (!found) {
+          throw new Error(`No simulator found with UDID "${udid}".`);
+        }
+
+        if (found.state !== "Booted") {
+          throw new Error(
+            `Simulator "${found.name}" (${udid}) is not booted (state: ${found.state}).`
+          );
+        }
+
+        managedSimulators.set(id, {
+          udid,
+          name: found.name,
+          owned: false,
+        });
+
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: `Attached to simulator: "${found.name}" (${udid})`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: errorWithTroubleshooting(
+                `Error attaching to simulator: ${toError(error).message}`
               ),
             },
           ],
@@ -229,22 +435,18 @@ if (!isToolFiltered("ui_describe_all")) {
     "ui_describe_all",
     "Describes accessibility information for the entire screen in the iOS Simulator",
     {
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
+      id: sessionIdSchema,
     },
     { title: "Describe All UI Elements", readOnlyHint: true, openWorldHint: true },
-    async ({ udid }) => {
+    async ({ id }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
 
         const { stdout } = await idb(
           "ui",
           "describe-all",
           "--udid",
-          actualUdid,
+          udid,
           "--json",
           "--nested"
         );
@@ -275,29 +477,25 @@ if (!isToolFiltered("ui_tap")) {
     "ui_tap",
     "Tap on the screen in the iOS Simulator",
     {
+      id: sessionIdSchema,
       duration: z
         .string()
         .regex(/^\d+(\.\d+)?$/)
         .optional()
         .describe("Press duration"),
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
       x: z.number().describe("The x-coordinate"),
-      y: z.number().describe("The x-coordinate"),
+      y: z.number().describe("The y-coordinate"),
     },
     { title: "UI Tap", readOnlyHint: false, openWorldHint: true },
-    async ({ duration, udid, x, y }) => {
+    async ({ id, duration, x, y }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
 
         const { stderr } = await idb(
           "ui",
           "tap",
           "--udid",
-          actualUdid,
+          udid,
           ...(duration ? ["--duration", duration] : []),
           "--json",
           // When passing user-provided values to a command, it's crucial to use `--`
@@ -336,11 +534,7 @@ if (!isToolFiltered("ui_type")) {
     "ui_type",
     "Input text into the iOS Simulator",
     {
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
+      id: sessionIdSchema,
       text: z
         .string()
         .max(500)
@@ -348,15 +542,15 @@ if (!isToolFiltered("ui_type")) {
         .describe("Text to input"),
     },
     { title: "UI Type", readOnlyHint: false, openWorldHint: true },
-    async ({ udid, text }) => {
+    async ({ id, text }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
 
         const { stderr } = await idb(
           "ui",
           "text",
           "--udid",
-          actualUdid,
+          udid,
           // When passing user-provided values to a command, it's crucial to use `--`
           // to separate the command's options from positional arguments.
           // This prevents the shell from misinterpreting the arguments as options.
@@ -394,16 +588,13 @@ if (!isToolFiltered("ui_swipe")) {
     "ui_swipe",
     "Swipe on the screen in the iOS Simulator",
     {
+      id: sessionIdSchema,
       duration: z
         .string()
         .regex(/^\d+(\.\d+)?$/)
         .optional()
-        .describe("Swipe duration in seconds (e.g., 0.1)"),
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
+        .default("1")
+        .describe("Swipe duration in seconds. Longer duration is a more controlled swipe."),
       x_start: z.number().describe("The starting x-coordinate"),
       y_start: z.number().describe("The starting y-coordinate"),
       x_end: z.number().describe("The ending x-coordinate"),
@@ -415,15 +606,15 @@ if (!isToolFiltered("ui_swipe")) {
         .default(1),
     },
     { title: "UI Swipe", readOnlyHint: false, openWorldHint: true },
-    async ({ duration, udid, x_start, y_start, x_end, y_end, delta }) => {
+    async ({ id, duration, x_start, y_start, x_end, y_end, delta }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
 
         const { stderr } = await idb(
           "ui",
           "swipe",
           "--udid",
-          actualUdid,
+          udid,
           ...(duration ? ["--duration", duration] : []),
           ...(delta ? ["--delta", String(delta)] : []),
           "--json",
@@ -465,24 +656,20 @@ if (!isToolFiltered("ui_describe_point")) {
     "ui_describe_point",
     "Returns the accessibility element at given co-ordinates on the iOS Simulator's screen",
     {
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
+      id: sessionIdSchema,
       x: z.number().describe("The x-coordinate"),
       y: z.number().describe("The y-coordinate"),
     },
     { title: "Describe UI Point", readOnlyHint: true, openWorldHint: true },
-    async ({ udid, x, y }) => {
+    async ({ id, x, y }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
 
         const { stdout, stderr } = await idb(
           "ui",
           "describe-point",
           "--udid",
-          actualUdid,
+          udid,
           "--json",
           // When passing user-provided values to a command, it's crucial to use `--`
           // to separate the command's options from positional arguments.
@@ -520,23 +707,19 @@ if (!isToolFiltered("ui_view")) {
     "ui_view",
     "Get the image content of a compressed screenshot of the current simulator view",
     {
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
+      id: sessionIdSchema,
     },
     { title: "View Screenshot", readOnlyHint: true, openWorldHint: true },
-    async ({ udid }) => {
+    async ({ id }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
 
         // Get screen dimensions in points from ui_describe_all
         const { stdout: uiDescribeOutput } = await idb(
           "ui",
           "describe-all",
           "--udid",
-          actualUdid,
+          udid,
           "--json",
           "--nested"
         );
@@ -550,6 +733,12 @@ if (!isToolFiltered("ui_view")) {
         const pointWidth = screenFrame.width;
         const pointHeight = screenFrame.height;
 
+        if (!pointWidth || !pointHeight) {
+          throw new Error(
+            "Simulator is still booting. Wait a few seconds and try again."
+          );
+        }
+
         // Generate unique file names with timestamp
         const ts = Date.now();
         const rawPng = path.join(TMP_ROOT_DIR, `ui-view-${ts}-raw.png`);
@@ -558,22 +747,23 @@ if (!isToolFiltered("ui_view")) {
           `ui-view-${ts}-compressed.jpg`
         );
 
-        // Capture screenshot as PNG
+        // Capture screenshot as PNG (always in physical portrait pixel orientation)
         await run("xcrun", [
           "simctl",
           "io",
-          actualUdid,
+          udid,
           "screenshot",
           "--type=png",
           "--",
           rawPng,
         ]);
 
-        // Resize to match point dimensions and compress to JPEG using sips
+        // Resize to logical point dimensions and compress to JPEG.
+        // This ensures pixel coordinates in the image match idb tap coordinates.
         await run("sips", [
           "-z",
-          String(pointHeight), // height in points
-          String(pointWidth), // width in points
+          String(pointHeight),
+          String(pointWidth),
           "-s",
           "format",
           "jpeg",
@@ -652,11 +842,7 @@ if (!isToolFiltered("screenshot")) {
     "screenshot",
     "Takes a screenshot of the iOS Simulator",
     {
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
+      id: sessionIdSchema,
       output_path: z
         .string()
         .max(1024)
@@ -683,16 +869,16 @@ if (!isToolFiltered("screenshot")) {
         ),
     },
     { title: "Take Screenshot", readOnlyHint: false, openWorldHint: true },
-    async ({ udid, output_path, type, display, mask }) => {
+    async ({ id, output_path, type, display, mask }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
         const absolutePath = ensureAbsolutePath(output_path);
 
         // command is weird, it responds with stderr on success and stdout is blank
         const { stderr: stdout } = await run("xcrun", [
           "simctl",
           "io",
-          actualUdid,
+          udid,
           "screenshot",
           ...(type ? [`--type=${type}`] : []),
           ...(display ? [`--display=${display}`] : []),
@@ -740,6 +926,7 @@ if (!isToolFiltered("record_video")) {
     "record_video",
     "Records a video of the iOS Simulator using simctl directly",
     {
+      id: sessionIdSchema,
       output_path: z
         .string()
         .max(1024)
@@ -773,8 +960,9 @@ if (!isToolFiltered("record_video")) {
         ),
     },
     { title: "Record Video", readOnlyHint: false, openWorldHint: true },
-    async ({ output_path, codec, display, mask, force }) => {
+    async ({ id, output_path, codec, display, mask, force }) => {
       try {
+        const udid = getManagedSimulatorId(id);
         const defaultFileName = `simulator_recording_${Date.now()}.mp4`;
         const outputFile = ensureAbsolutePath(output_path ?? defaultFileName);
 
@@ -782,7 +970,7 @@ if (!isToolFiltered("record_video")) {
         const recordingProcess = spawn("xcrun", [
           "simctl",
           "io",
-          "booted",
+          udid,
           "recordVideo",
           ...(codec ? [`--codec=${codec}`] : []),
           ...(display ? [`--display=${display}`] : []),
@@ -848,11 +1036,14 @@ if (!isToolFiltered("stop_recording")) {
   server.tool(
     "stop_recording",
     "Stops the simulator video recording using killall",
-    {},
+    {
+      id: sessionIdSchema,
+    },
     { title: "Stop Recording", readOnlyHint: false, openWorldHint: true },
-    async () => {
+    async ({ id }) => {
       try {
-        await run("pkill", ["-SIGINT", "-f", "simctl.*recordVideo"]);
+        const udid = getManagedSimulatorId(id);
+        await run("pkill", ["-SIGINT", "-f", `simctl io ${udid} recordVideo`]);
 
         // Wait a moment for the video to finalize
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -888,11 +1079,7 @@ if (!isToolFiltered("install_app")) {
     "install_app",
     "Installs an app bundle (.app or .ipa) on the iOS Simulator",
     {
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
+      id: sessionIdSchema,
       app_path: z
         .string()
         .max(1024)
@@ -901,9 +1088,9 @@ if (!isToolFiltered("install_app")) {
         ),
     },
     { title: "Install App", readOnlyHint: false, openWorldHint: true },
-    async ({ udid, app_path }) => {
+    async ({ id, app_path }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
         const absolutePath = path.isAbsolute(app_path)
           ? app_path
           : path.resolve(app_path);
@@ -914,7 +1101,7 @@ if (!isToolFiltered("install_app")) {
         }
 
         // run() will throw if the command fails (non-zero exit code)
-        await run("xcrun", ["simctl", "install", actualUdid, absolutePath]);
+        await run("xcrun", ["simctl", "install", udid, absolutePath]);
 
         return {
           isError: false,
@@ -947,11 +1134,7 @@ if (!isToolFiltered("launch_app")) {
     "launch_app",
     "Launches an app on the iOS Simulator by bundle identifier",
     {
-      udid: z
-        .string()
-        .regex(UDID_REGEX)
-        .optional()
-        .describe("Udid of target, can also be set with the IDB_UDID env var"),
+      id: sessionIdSchema,
       bundle_id: z
         .string()
         .max(256)
@@ -966,16 +1149,16 @@ if (!isToolFiltered("launch_app")) {
         ),
     },
     { title: "Launch App", readOnlyHint: false, openWorldHint: true },
-    async ({ udid, bundle_id, terminate_running }) => {
+    async ({ id, bundle_id, terminate_running }) => {
       try {
-        const actualUdid = await getBootedDeviceId(udid);
+        const udid = getManagedSimulatorId(id);
 
         // run() will throw if the command fails (non-zero exit code)
         const { stdout } = await run("xcrun", [
           "simctl",
           "launch",
           ...(terminate_running ? ["--terminate-running-process"] : []),
-          actualUdid,
+          udid,
           bundle_id,
         ]);
 
@@ -1019,9 +1202,10 @@ async function runServer() {
 
 runServer().catch(console.error);
 
-process.stdin.on("close", () => {
+process.stdin.on("close", async () => {
   console.log("iOS Simulator MCP Server closed");
   server.close();
+  await cleanupAllSimulators();
   try {
     fs.rmSync(TMP_ROOT_DIR, { recursive: true, force: true });
   } catch (error) {
