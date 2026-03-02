@@ -82,10 +82,17 @@ function isToolFiltered(toolName: string): boolean {
 
 // --- Simulator lifecycle management ---
 
+type Orientation =
+  | "auto"
+  | "portrait"
+  | "landscape_right"
+  | "upside_down"
+  | "landscape_left";
+
 /** Tracks managed simulators by session id */
 const managedSimulators = new Map<
   string,
-  { udid: string; name: string; owned: boolean }
+  { udid: string; name: string; owned: boolean; orientation: Orientation }
 >();
 
 /** Zod schema for the session id parameter, reused across all tools */
@@ -182,6 +189,103 @@ async function cleanupAllSimulators(): Promise<void> {
   managedSimulators.clear();
 }
 
+// --- Coordinate transformation ---
+
+interface Frame {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Determines the effective orientation for a session given the screen dimensions.
+ * "auto" detects portrait (w <= h) vs landscape_right (w > h).
+ */
+function getEffectiveOrientation(
+  orientation: Orientation,
+  screenWidth: number,
+  screenHeight: number
+): Orientation {
+  if (orientation !== "auto") return orientation;
+  return screenWidth > screenHeight ? "landscape_right" : "portrait";
+}
+
+/**
+ * Transforms a frame from describe_all's rotated logical space to portrait space.
+ * screenW/screenH are the root frame dimensions from describe_all.
+ */
+function transformFrame(
+  frame: Frame,
+  orientation: Orientation,
+  screenW: number,
+  screenH: number
+): Frame {
+  switch (orientation) {
+    case "portrait":
+    case "auto":
+      return frame;
+
+    case "landscape_right":
+      return {
+        x: frame.y,
+        y: screenW - frame.x - frame.width,
+        width: frame.height,
+        height: frame.width,
+      };
+
+    case "landscape_left":
+      return {
+        x: screenH - frame.y - frame.height,
+        y: frame.x,
+        width: frame.height,
+        height: frame.width,
+      };
+
+    case "upside_down":
+      return {
+        x: screenW - frame.x - frame.width,
+        y: screenH - frame.y - frame.height,
+        width: frame.width,
+        height: frame.height,
+      };
+  }
+}
+
+/**
+ * Formats a frame as an AXFrame string: "{{x, y}, {width, height}}"
+ */
+function formatAXFrame(frame: Frame): string {
+  return `{{${frame.x}, ${frame.y}}, {${frame.width}, ${frame.height}}}`;
+}
+
+/**
+ * Recursively transforms all frames in a describe_all/describe_point JSON tree.
+ */
+function transformElementTree(
+  elements: any[],
+  orientation: Orientation,
+  screenW: number,
+  screenH: number
+): any[] {
+  return elements.map((el) => {
+    const transformed = { ...el };
+    if (el.frame && (el.frame.width || el.frame.height)) {
+      transformed.frame = transformFrame(el.frame, orientation, screenW, screenH);
+      transformed.AXFrame = formatAXFrame(transformed.frame);
+    }
+    if (el.children && Array.isArray(el.children)) {
+      transformed.children = transformElementTree(
+        el.children,
+        orientation,
+        screenW,
+        screenH
+      );
+    }
+    return transformed;
+  });
+}
+
 // --- Server setup ---
 
 const server = new McpServer(
@@ -264,7 +368,12 @@ if (!isToolFiltered("start_simulator")) {
         // Ensure Simulator.app is open
         await run("open", ["-a", "Simulator.app"]);
 
-        managedSimulators.set(id, { udid, name: deviceName, owned: true });
+        managedSimulators.set(id, {
+          udid,
+          name: deviceName,
+          owned: true,
+          orientation: "auto",
+        });
 
         return {
           isError: false,
@@ -402,6 +511,7 @@ if (!isToolFiltered("attach_simulator")) {
           udid,
           name: found.name,
           owned: false,
+          orientation: "auto",
         });
 
         return {
@@ -430,6 +540,64 @@ if (!isToolFiltered("attach_simulator")) {
   );
 }
 
+if (!isToolFiltered("set_rotation_coords")) {
+  server.tool(
+    "set_rotation_coords",
+    "Sets the coordinate rotation mapping for a session. By default (auto), portrait and landscape_right are detected automatically. Use this to override when the simulator is in landscape_left or upside_down orientation.",
+    {
+      id: sessionIdSchema,
+      orientation: z
+        .enum([
+          "auto",
+          "portrait",
+          "landscape_right",
+          "upside_down",
+          "landscape_left",
+        ])
+        .describe(
+          "The device orientation. 'auto' detects portrait vs landscape_right."
+        ),
+    },
+    {
+      title: "Set Rotation Coordinates",
+      readOnlyHint: false,
+      openWorldHint: false,
+    },
+    async ({ id, orientation }) => {
+      try {
+        const sim = managedSimulators.get(id);
+        if (!sim) {
+          throw new Error(
+            `No simulator is running for session "${id}". Call start_simulator first.`
+          );
+        }
+
+        sim.orientation = orientation as Orientation;
+
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: `Coordinate rotation set to "${orientation}" for session "${id}".`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Error setting rotation: ${toError(error).message}`,
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
 if (!isToolFiltered("ui_describe_all")) {
   server.tool(
     "ui_describe_all",
@@ -440,16 +608,47 @@ if (!isToolFiltered("ui_describe_all")) {
     { title: "Describe All UI Elements", readOnlyHint: true, openWorldHint: true },
     async ({ id }) => {
       try {
-        const udid = getManagedSimulatorId(id);
+        const sim = managedSimulators.get(id);
+        if (!sim) {
+          throw new Error(
+            `No simulator is running for session "${id}". Call start_simulator first.`
+          );
+        }
 
         const { stdout } = await idb(
           "ui",
           "describe-all",
           "--udid",
-          udid,
+          sim.udid,
           "--json",
           "--nested"
         );
+
+        const elements = JSON.parse(stdout);
+        const screenFrame = elements[0]?.frame;
+
+        if (screenFrame && (screenFrame.width || screenFrame.height)) {
+          const orientation = getEffectiveOrientation(
+            sim.orientation,
+            screenFrame.width,
+            screenFrame.height
+          );
+
+          if (orientation !== "portrait") {
+            const transformed = transformElementTree(
+              elements,
+              orientation,
+              screenFrame.width,
+              screenFrame.height
+            );
+            return {
+              isError: false,
+              content: [
+                { type: "text", text: JSON.stringify(transformed) },
+              ],
+            };
+          }
+        }
 
         return {
           isError: false,
@@ -663,13 +862,18 @@ if (!isToolFiltered("ui_describe_point")) {
     { title: "Describe UI Point", readOnlyHint: true, openWorldHint: true },
     async ({ id, x, y }) => {
       try {
-        const udid = getManagedSimulatorId(id);
+        const sim = managedSimulators.get(id);
+        if (!sim) {
+          throw new Error(
+            `No simulator is running for session "${id}". Call start_simulator first.`
+          );
+        }
 
         const { stdout, stderr } = await idb(
           "ui",
           "describe-point",
           "--udid",
-          udid,
+          sim.udid,
           "--json",
           // When passing user-provided values to a command, it's crucial to use `--`
           // to separate the command's options from positional arguments.
@@ -681,9 +885,41 @@ if (!isToolFiltered("ui_describe_point")) {
 
         if (stderr) throw new Error(stderr);
 
+        // Transform the returned frame to portrait coordinates if rotated
+        const element = JSON.parse(stdout);
+
+        if (element.frame && (element.frame.width || element.frame.height)) {
+          const { stdout: allOutput } = await idb(
+            "ui",
+            "describe-all",
+            "--udid",
+            sim.udid,
+            "--json",
+            "--nested"
+          );
+          const allData = JSON.parse(allOutput);
+          const screenFrame = allData[0]?.frame;
+          if (screenFrame) {
+            const orientation = getEffectiveOrientation(
+              sim.orientation,
+              screenFrame.width,
+              screenFrame.height
+            );
+            if (orientation !== "portrait") {
+              element.frame = transformFrame(
+                element.frame,
+                orientation,
+                screenFrame.width,
+                screenFrame.height
+              );
+              element.AXFrame = formatAXFrame(element.frame);
+            }
+          }
+        }
+
         return {
           isError: false,
-          content: [{ type: "text", text: stdout }],
+          content: [{ type: "text", text: JSON.stringify(element) }],
         };
       } catch (error) {
         return {
@@ -730,8 +966,9 @@ if (!isToolFiltered("ui_view")) {
           throw new Error("Could not determine screen dimensions");
         }
 
-        const pointWidth = screenFrame.width;
-        const pointHeight = screenFrame.height;
+        // Always use portrait dimensions (screenshot is in portrait pixel orientation)
+        const pointWidth = Math.min(screenFrame.width, screenFrame.height);
+        const pointHeight = Math.max(screenFrame.width, screenFrame.height);
 
         if (!pointWidth || !pointHeight) {
           throw new Error(
